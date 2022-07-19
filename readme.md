@@ -2,7 +2,6 @@
 
 Jovita Lukasik, Steffen Jung, Margret Keuper
 
-In ECCV 2022
 
 ## Generative Model using Latent Space Optimization 
 
