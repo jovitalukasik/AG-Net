@@ -37,7 +37,6 @@ Define directory path in Settings.py
 ### Generation 
 
 ```
-**NAS-Bench-101**
 Train_G_NB101.sh
 Train_G_NB201.sh
 Train_G_NBNLP.sh
