@@ -2,11 +2,12 @@ import torch
 import numpy as np
 import sys, os, random, argparse, pickle, tqdm
 from datetime import datetime
-
+import xgboost as xgb
 
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
 from Measurements import Measurements
 from Optimizer import Optimizer
@@ -30,20 +31,20 @@ if DEBUGGING:
 parser = argparse.ArgumentParser(description='Args for NAS latent space search experiments')
 parser.add_argument("--device",                 type=str, default="cpu")
 parser.add_argument('--trials',                 type=int, default=1, help='Number of trials')
-parser.add_argument("--dataset",                type=str, default='NB201', help='Choice between NB101 and NB201')
+parser.add_argument("--dataset",                type=str, default='NB101', help='Choice between NB101 and NB201')
 parser.add_argument('--image_data',             type=str, default='cifar10_valid_converged', help='Only for NB201 relevant, choices between [cifar10_valid_converged, cifar100, ImageNet16-120]')
-parser.add_argument("--name",                   type=str, default="Tabular_Search_wo_bp")
+parser.add_argument("--name",                   type=str, default="Tabular_Search_XGB")
 parser.add_argument("--weight_factor",          type=float, default=10e-3)
 parser.add_argument("--num_init",               type=int, default=16)
 parser.add_argument("--k",                      type=int, default=16)
 parser.add_argument("--num_test",               type=int, default=1_00)
-parser.add_argument("--ticks",                  type=int, default=30)
+parser.add_argument("--ticks",                  type=int, default=1)
 parser.add_argument("--tick_size",              type=int, default=16)  
 parser.add_argument("--batch_size",             type=int, default=16)
 parser.add_argument("--search_data",            type=int, default=310)
-parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBench201")
+parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBench101")
 parser.add_argument("--saved_iteration",        type=str,  default='best' , help="Which iteration to load of pretrained Generator")
-parser.add_argument("--seed",                   type=int, default=1)
+parser.add_argument("--seed",                   type=int, default=0)
 parser.add_argument("--alpha",                  type=float, default=0.9)
 parser.add_argument("--verbose",                type=str, default=True)
 
@@ -56,7 +57,7 @@ args = parser.parse_args()
 ##############################################################################
 now = datetime.now()
 runfolder = now.strftime("%Y_%m_%d_%H_%M_%S")
-runfolder = f"NAS_Search_wo_bp_{args.dataset}/{args.image_data}/{runfolder}_{args.name}_{args.dataset}_{args.seed}"
+runfolder = f"NAS_Search_XGB_{args.dataset}/{args.image_data}/{runfolder}_{args.name}_{args.dataset}_{args.seed}"
 runfolder = os.path.join(Settings.FOLDER_EXPERIMENTS, runfolder)
 if not os.path.exists(runfolder):
     os.makedirs(runfolder)
@@ -91,6 +92,8 @@ def sample_data(G,
             noise = (-6) * torch.rand(j, latent_dim) + 3
             graphs = G(noise.to(device))
             valid_sampled_data = measurements._compute_validity_score(graphs, search_space,  return_valid_spec=True)
+            if valid_sampled_data == []:
+                continue
             sampled_y = torch.stack([g.y for g in valid_sampled_data])
             sampled_hash_idx = dataset.query(sampled_y)  
             validity += len(valid_sampled_data)
@@ -104,7 +107,6 @@ def sample_data(G,
                 possible_candidates = [possible_candidates[i] for i in random_shuffle[:num]]
                 break
 
-    validity = validity/v
     return possible_candidates, visited, validity
 
 def get_rank_weights(outputs, weight_factor):
@@ -143,36 +145,20 @@ def train(
     G, 
     weights,
     optimizer,
-    alpha,
 ):  
     optimizer.zero_grad()
 
-    noise = torch.randn(
-        b_size, 32,
-        device = real.x.device
-        )
-    nodes, edges = G.Decoder(noise)
-    
-    ln = G.node_criterion(nodes.view(-1,G.num_node_atts),  torch.argmax(real.x_binary, dim=1).view(b_size,-1).flatten())
-    le = G.edge_criterion(edges, real.scores.view(b_size, -1))
+    generated, recon_loss, mse = G.loss(real, b_size)
+    err = (1-args.alpha)*recon_loss
+    err = torch.mean(err*weights.to(recon_loss.device))
 
-    ln = torch.mean(ln.view(b_size, -1),1)
-    le = torch.mean(le,1) 
-    recon_loss = 2*(ln+ 0.5*le)
-
-    acc = G.Predictor(real.y.reshape(b_size,-1))
-    mse = G.acc_criterion(acc.view(-1), real.val_acc)
-
-    err = (1-alpha)*recon_loss + alpha*mse
-    err = torch.mean(err*weights.to(nodes.device))
     err.backward()
     # optimize
     optimizer.step()
     # return stats
     
     return (err.item(), 
-            recon_loss.mean().item(), 
-            mse.mean().item()
+            recon_loss.mean().item()
             )
 
 def save_data(Dataset, train_data, path_measures, verbose=False):
@@ -187,6 +173,43 @@ def save_data(Dataset, train_data, path_measures, verbose=False):
         print('Top 5 acc after gradient method {}'.format(top_5_acc))
 
     return train_data
+
+def train_tree(train_data):
+
+    params = {
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
+            "booster": "gbtree",
+            "max_depth": 6,
+            "min_child_weight": 1,
+            "colsample_bytree": 1,
+            "learning_rate": 0.3,
+            "colsample_bylevel": 1,
+        }
+    encodings = np.array([arch.y.numpy() for arch in train_data])
+
+    ytrain = np.array([arch.val_acc.numpy() for arch in train_data])
+    # normalize accuracies
+    mean = np.mean(ytrain)
+    std = np.std(ytrain)
+    train_data = xgb.DMatrix(encodings, label=((ytrain - mean) / std))
+    bst = xgb.train(params, train_data, num_boost_round=500)    
+    # predict
+    train_pred = np.squeeze(bst.predict(train_data))
+    train_error = np.mean(abs(train_pred - ytrain))
+    return bst
+
+def eval_tree(bst, test_data):
+
+    encodings = np.array([arch.y.numpy() for arch in test_data])
+
+    tree_test_data = xgb.DMatrix(encodings)
+    preds = bst.predict(tree_test_data)    
+
+    for i, arch in enumerate(test_data):
+        arch.val_acc = torch.FloatTensor([preds[i]])
+
+    return test_data
 
 ##############################################################################
 def training_loop():
@@ -220,23 +243,25 @@ def training_loop():
 
                 b_size = batch.batch.max().item() + 1
 
-                err, recon_loss, pred_loss =  train(
+                err, recon_loss =  train(
                     real = batch,
                     b_size = b_size,
                     G = G,
                     weights = w,
                     optimizer = optimizerG,
-                    alpha = args.alpha, 
                 )
                 # measurements for saving
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
-                measurements.add_measure("pred_loss",      pred_loss,      instances)
 
                 instances += b_size
-                
+                            
 
             if instances >= instances_total:
+                if args.verbose:
+                    pbar.write("Starting Training Tree Method for data size {}...".format(len(conditional_train_data)))
+                # Train Tree Method
+                bst = train_tree(conditional_train_data)
                 if args.verbose:
                     pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
@@ -250,8 +275,11 @@ def training_loop():
                 torch.save(test_data, 
                     path_measures.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
-
-                # Sort given the surrogate model
+                if test_data == []:
+                    search_data = len(conditional_train_data)
+                    continue
+                # Eval all data and sort by xgb
+                test_data =  eval_tree(bst, test_data)
                 sort = sorted(test_data, key=lambda i:i.val_acc)
 
                 for arch in sort[-args.k:]:
@@ -261,7 +289,6 @@ def training_loop():
                     arch.to('cpu')
                     conditional_train_data.append(arch)
 
-                checkpoint.save(len(conditional_train_data), only_model=True) 
 
                 instances = 0
                 tick_size += len(conditional_train_data)-n
@@ -302,7 +329,6 @@ def training_loop():
 
 ##############################################################################
 
-# torch.autograd.set_detect_anomaly(True)
 if __name__ == "__main__":
     for i in range(args.trials):
         if args.trials > 1:
@@ -330,14 +356,8 @@ if __name__ == "__main__":
 
         # load Checkpoint for pretrained Generator + MLP Predictor
         m = torch.load(os.path.join(args.saved_path, f"{args.saved_iteration}.model"), map_location=args.device) #pretrained_dict
-        if args.dataset == 'NB101':
-            m["nets"]["G"]["pars"]["data_config"]["regression_input"] = 56
-        elif args.dataset == 'NB201':
-            m["nets"]["G"]["pars"]["data_config"]["regression_input"] = 84
-        m["nets"]["G"]["pars"]["data_config"]["regression_output"] = 1
-        m["nets"]["G"]["pars"]["data_config"]["regression_hidden"] = m["nets"]["G"]["pars"]["data_config"]["regression_input"]
-        m["nets"]["G"]["pars"]["acc_prediction"] = True
         m["nets"]["G"]["pars"]["list_all_lost"] = True
+        m["nets"]["G"]["pars"]["acc_prediction"] = False
         G = Generator_Decoder(**m["nets"]["G"]["pars"]).to(args.device)
         state_dict = m["nets"]["G"]["state"]
         G_dict = G.state_dict()
@@ -410,7 +430,4 @@ if __name__ == "__main__":
             measurements = measurements
         )
     
-
-
-
         training_loop()

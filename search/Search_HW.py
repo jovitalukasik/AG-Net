@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder, MLP_predictor
 import datasets.NASBenchHW as NASBenchHW
 NASBenchHW.nasbench #= NASBench201.nasbench

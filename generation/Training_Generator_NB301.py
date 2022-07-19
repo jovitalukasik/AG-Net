@@ -4,10 +4,9 @@ import torch
 import numpy as np
 from ConfigSpace.read_and_write import json as config_space_json_r_w
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
-import datasets.NASBench101 as NASBench101 
-import datasets.NASBench201 as NASBench201
-import datasets.NASBenchNLP as NASBenchNLP
+import datasets.NASBench301 as NASBench301
 from Measurements import Measurements
 from Optimizer import Optimizer
 from Checkpoint import Checkpoint
@@ -28,11 +27,15 @@ if DEBUGGING:
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device",                 type=str, default="cpu")
-parser.add_argument("--dataset",                type=str, default='NB101', help='Choice between NB101, NB201 and NBNLP')
+parser.add_argument("--dataset",                type=str, default='NB301')
 parser.add_argument("--deterministic",          type=int, default=0)
 parser.add_argument("--name",                   type=str, default="Train_Generator")
 parser.add_argument("--ticks",                  type=int, default=10)
 parser.add_argument("--tick_size",              type=int, default=10_0)
+parser.add_argument("--b_size",                 type=int, default=256)
+parser.add_argument("--node_embedding_dim",     type=int, default=32)
+parser.add_argument("--graph_embedding_dim",    type=int, default=32)
+parser.add_argument("--gnn_iteration_layers",   type=int, default=4)
 parser.add_argument("--criterion",              type=str, default="decoding", help= "Choices between decoding, MLP_decoding")
 
 args = parser.parse_args()
@@ -81,12 +84,8 @@ print(f"Experiment folder: {runfolder}")
 #
 ##############################################################################
 
-if args.dataset=='NB101':
-    data_config_path='configs/data_configs/NB101_configspace.json'
-elif args.dataset=='NB201':
-    data_config_path='configs/data_configs/NB201_configspace.json'
-elif args.dataset=='NBNLP':
-    data_config_path='configs/data_configs/NBNLP_configspace.json'
+if args.dataset=='NB301':
+    data_config_path='configs/data_configs/NB301_configspace.json'
 else:
     raise TypeError("Unknow Seach Space : {:}".format(args.dataset))
 
@@ -97,12 +96,16 @@ model_config_path='configs/model_configs/ag_configspace.json'
 model_configspace = config_space_json_r_w.read(open(model_config_path, 'r').read())
 model_config = model_configspace.get_default_configuration().get_dictionary()
 
+model_config['batch_size']  = args.b_size
+model_config['node_embedding_dim']  = args.node_embedding_dim
+model_config['graph_embedding_dim']  = args.graph_embedding_dim
+model_config['gnn_iteration_layers']  = args.gnn_iteration_layers
 ##############################################################################
 #
 #                              Generator
 #
 ##############################################################################
-G = Generator_Decoder(model_config=model_config, data_config=data_config).to(args.device)
+G = Generator_Decoder(model_config=model_config, data_config=data_config, nb301=True).to(args.device)
 
 print("Generator parameters:")
 print(G.pars)
@@ -128,15 +131,9 @@ optimizerG = Optimizer(G, args.criterion).optimizer
 ##############################################################################
 
 print("Creating Dataset.")
-if args.dataset=='NB101':
-    NASBench = NASBench101
-    dataset = NASBench101.Dataset(batch_size=model_config['batch_size'])
-elif args.dataset=='NB201':
-    NASBench = NASBench201
-    dataset = NASBench201.Dataset(batch_size=model_config['batch_size'])
-elif args.dataset=='NBNLP':
-    NASBench = NASBenchNLP
-    dataset = NASBenchNLP.Dataset(batch_size=model_config['batch_size'])
+if args.dataset=='NB301':
+    NASBench = NASBench301
+    dataset = NASBench301.Dataset(batch_size=model_config['batch_size'], generation=True)
 else:
     raise TypeError("Unknow Seach Space : {:}".format(args.dataset))
 
@@ -158,7 +155,7 @@ measurements = Measurements(
     NASBench = NASBench
 )
 measurements.set_fid_real_stats(
-    np.array([g.y.cpu().numpy() for g in dataset.data])
+    np.array([g.y_normal.cpu().numpy() for g in dataset.data])
 )
 
 ##############################################################################
@@ -200,15 +197,34 @@ def train(
 
     optimizer.zero_grad()
 
-    generated, err, mse = G.loss(real, b_size)
+    noise = torch.randn(
+        b_size, model_config['graph_embedding_dim'], device=real.x_normal.device
+    )
+    nodes, edges = G.Decoder(noise)
+    ln = G.node_criterion(nodes.view(-1, G.num_node_atts), torch.argmax(real.x_binary_normal, dim=1).view(b_size,-1).flatten())
+    le = G.edge_criterion(edges, real.scores_normal.view(b_size,-1))
 
+    recon_loss_normal = 2*(0.5*ln + 0.5*le)
+
+    noise = torch.randn(
+        b_size, model_config['graph_embedding_dim'], device=real.x_normal.device
+    )
+    nodes, edges = G.Decoder(noise)
+    ln = G.node_criterion(nodes.view(-1, G.num_node_atts), torch.argmax(real.x_binary_reduce, dim=1).view(b_size,-1).flatten())
+    le = G.edge_criterion(edges, real.scores_reduce.view(b_size,-1))
+
+    recon_loss_reduce = 2*(0.5*ln + 0.5*le)
+    err = recon_loss_normal + recon_loss_reduce
 
     err.backward()
     # optimize
     optimizer.step()
     # return stats
 
-    return err.item(), 
+    return (err.item(),
+            recon_loss_normal.item(), 
+            recon_loss_reduce.item()
+    ) 
 
 ##############################################################################
 
@@ -237,7 +253,7 @@ def training_loop():
                 instances += b_size
 
                 ### Training step for G ###
-                err =  train(
+                err, recon_loss_normal, recon_loss_reduce =  train(
                     real = real,
                     b_size = b_size,
                     G = G,
@@ -246,7 +262,9 @@ def training_loop():
 
                 
                 # measurements for saving
-                measurements.add_measure("train_loss",      err,      instances)
+                measurements.add_measure("train_loss",         err,               instances)
+                measurements.add_measure("recon_loss_normal",  recon_loss_normal, instances)
+                measurements.add_measure("recon_loss_reduce",  recon_loss_reduce, instances)
 
                 pbar.update(b_size)
 
@@ -262,7 +280,7 @@ def training_loop():
                         instances,
                         args.dataset,
                         args.device,
-                        prediction
+                        prediction, 
                     )                      
                     checkpoint.save(instances)
 
@@ -270,6 +288,7 @@ def training_loop():
                 
 
             if instances >= instances_total:
+                # return
                 break
             
 ##############################################################################

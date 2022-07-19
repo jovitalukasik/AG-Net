@@ -2,11 +2,12 @@ import torch
 import numpy as np
 import sys, os, random, argparse, pickle, tqdm
 from datetime import datetime
-import torch.nn.functional as F
+import xgboost as xgb
 
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
 from Measurements import Measurements
 from Optimizer import Optimizer
@@ -31,13 +32,13 @@ parser.add_argument("--device",                 type=str, default="cpu")
 parser.add_argument('--trials',                 type=int, default=1, help='Number of trials')
 parser.add_argument('--dataset',                type=str, default='NB301')
 parser.add_argument('--image_data',             type=str, default='cifar10', help='Only for NB201 relevant, choices between [cifar10_valid_converged, cifar100, ImageNet16-120]')
-parser.add_argument("--name",                   type=str, default="Surrogate_Search")
+parser.add_argument("--name",                   type=str, default="Surrogate_Search_XGB")
 parser.add_argument("--weight_factor",          type=float, default=10e-3)
 parser.add_argument("--num_init",               type=int, default=16)
 parser.add_argument("--k",                      type=int, default=16)
 parser.add_argument("--num_test",               type=int, default=1_00)
 parser.add_argument("--ticks",                  type=int, default=1)
-parser.add_argument("--tick_size",              type=int, default=16) 
+parser.add_argument("--tick_size",              type=int, default=16)
 parser.add_argument("--batch_size",             type=int, default=16)
 parser.add_argument("--search_data",            type=int, default=304)
 parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBench301")
@@ -55,7 +56,7 @@ args = parser.parse_args()
 ##############################################################################
 now = datetime.now()
 runfolder = now.strftime("%Y_%m_%d_%H_%M_%S")
-runfolder = f"NAS_Search_{args.dataset}/surrogate_search/{args.search_data}/reduce/{runfolder}_reduce_{args.name}_{args.dataset}_{args.seed}"
+runfolder = f"NAS_Search_XGB_{args.dataset}/surrogate_search/{args.search_data}/reduce/{runfolder}_reduce_{args.name}_{args.dataset}_{args.seed}"
 runfolder = os.path.join(Settings.FOLDER_EXPERIMENTS, runfolder)
 if not os.path.exists(runfolder):
     os.makedirs(runfolder)
@@ -272,14 +273,7 @@ def train(
     le = torch.mean(le,1)
     recon_loss= 2*(ln+ 0.5*le)
 
-
-    generated = torch.cat((nodes, edges),1)
-
-    acc = G.Predictor(generated)
-    mse = G.acc_criterion(acc.view(-1), real.acc)
-
-    err = (1-alpha)*recon_loss + alpha*mse
-    err = torch.mean(err*weights.to(generated.device))
+    err = torch.mean((1-alpha)*recon_loss *weights.to(recon_loss.device))
     optimizer.zero_grad()
 
     err.backward()
@@ -288,9 +282,53 @@ def train(
     # return stats
 
     return (err.item(),
-            recon_loss.mean().item(),
-            mse.mean().item()
+            recon_loss.mean().item()
             )
+def train_tree(train_data, normal_cell):
+    
+    params = {
+            "objective": "reg:squarederror",
+            "eval_metric": "rmse",
+            "booster": "gbtree",
+            "max_depth": 6,
+            "min_child_weight": 1,
+            "colsample_bytree": 1,
+            "learning_rate": 0.3,
+            "colsample_bylevel": 1,
+        }
+
+    if normal_cell:    
+    # encode train data to adajcency one hot:
+        encodings = np.array([arch.y_normal.numpy() for arch in train_data])
+    else:    
+        encodings = np.array([arch.y_reduce.numpy() for arch in train_data])
+
+    ytrain = np.array([arch.acc.numpy() for arch in train_data])
+    # normalize accuracies
+    mean = np.mean(ytrain)
+    std = np.std(ytrain)
+    train_data = xgb.DMatrix(encodings, label=((ytrain - mean) / std))
+    bst = xgb.train(params, train_data, num_boost_round=500)    
+    # predict
+    train_pred = np.squeeze(bst.predict(train_data))
+    train_error = np.mean(abs(train_pred - ytrain))
+    print("RMSE: %f" % (train_error))
+    return bst
+
+def eval_tree(bst, test_data, normal_cell):
+
+    if normal_cell:    
+        encodings = np.array([arch.y_normal.numpy() for arch in test_data])
+    else:    
+        encodings = np.array([arch.y_reduce.numpy() for arch in test_data])
+
+    tree_test_data = xgb.DMatrix(encodings)
+    preds = bst.predict(tree_test_data)    
+
+    for i, arch in enumerate(test_data):
+        arch.acc = torch.FloatTensor([preds[i]])
+
+    return test_data
 
 def save_data(Dataset, train_data, path_measures, verbose=False):
     train_data = [Dataset.get_info_generated_graph(d, args.image_data) for d in train_data]
@@ -338,7 +376,7 @@ def training_loop():
 
                 b_size = batch.batch.max().item() + 1
 
-                err, recon_loss, pred_loss =  train(
+                err, recon_loss =  train(
                     real = batch,
                     b_size = b_size,
                     G = G,
@@ -351,12 +389,16 @@ def training_loop():
                 # measurements for saving
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
-                measurements.add_measure("pred_loss",      pred_loss,      instances)
 
                 instances += b_size
 
 
             if instances >= instances_total:
+                if args.verbose:
+                    pbar.write("Starting Training Tree Method for data size {}...".format(len(conditional_train_data)))
+                # Train Tree Method
+                bst = train_tree(conditional_train_data, normal_cell=True)
+
                 pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
                 visited = {}
@@ -369,6 +411,9 @@ def training_loop():
                 torch.save(test_data,
                     path_measures_normal.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
+
+                test_data =  eval_tree(bst, test_data,normal_cell=True)
+
 
                 # Sort given the surrogate model
                 sort = sorted(test_data, key=lambda i:i.acc, reverse=True)
@@ -444,7 +489,7 @@ def training_loop():
 
                 b_size = batch.batch.max().item() + 1
 
-                err, recon_loss, pred_loss =  train(
+                err, recon_loss =  train(
                     real = batch,
                     b_size = b_size,
                     G = G,
@@ -457,12 +502,16 @@ def training_loop():
                 # measurements for saving
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
-                measurements.add_measure("pred_loss",      pred_loss,      instances)
 
                 instances += b_size
 
 
             if instances >= instances_total:
+                if args.verbose:
+                    pbar.write("Starting Training Tree Method for data size {}...".format(len(conditional_train_data)))
+                # Train Tree Method
+                bst = train_tree(conditional_train_data, normal_cell=False)
+                
                 pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
                 visited = {}
@@ -475,6 +524,8 @@ def training_loop():
                 torch.save(test_data,
                     path_measures_reduce.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
+
+                test_data =  eval_tree(bst, test_data,normal_cell=False)
 
                 # Sort given the surrogate model
                 sort = sorted(test_data, key=lambda i:i.acc, reverse=True)

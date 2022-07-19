@@ -2,12 +2,12 @@ import torch
 import numpy as np
 import sys, os, random, argparse, pickle, tqdm
 from datetime import datetime
-import xgboost as xgb
-from torch.autograd import Variable
+import torch.nn.functional as F
 
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
 from Measurements import Measurements
 from Optimizer import Optimizer
@@ -32,13 +32,13 @@ parser.add_argument("--device",                 type=str, default="cpu")
 parser.add_argument('--trials',                 type=int, default=1, help='Number of trials')
 parser.add_argument('--dataset',                type=str, default='NB301')
 parser.add_argument('--image_data',             type=str, default='cifar10', help='Only for NB201 relevant, choices between [cifar10_valid_converged, cifar100, ImageNet16-120]')
-parser.add_argument("--name",                   type=str, default="Surrogate_Search_XGB_ranking")
+parser.add_argument("--name",                   type=str, default="Surrogate_Search")
 parser.add_argument("--weight_factor",          type=float, default=10e-3)
 parser.add_argument("--num_init",               type=int, default=16)
 parser.add_argument("--k",                      type=int, default=16)
 parser.add_argument("--num_test",               type=int, default=1_00)
 parser.add_argument("--ticks",                  type=int, default=1)
-parser.add_argument("--tick_size",              type=int, default=16)
+parser.add_argument("--tick_size",              type=int, default=16) 
 parser.add_argument("--batch_size",             type=int, default=16)
 parser.add_argument("--search_data",            type=int, default=304)
 parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBench301")
@@ -46,8 +46,6 @@ parser.add_argument("--saved_iteration",        type=str, default="best", help="
 parser.add_argument("--seed",                   type=int, default=1)
 parser.add_argument("--alpha",                  type=float, default=0.9)
 parser.add_argument("--verbose",                type=str, default=True)
-parser.add_argument("--epochs",                 type=int, default=20)
-parser.add_argument("--lr",                     type=float, default=0.01)
 
 args = parser.parse_args()
 
@@ -58,7 +56,7 @@ args = parser.parse_args()
 ##############################################################################
 now = datetime.now()
 runfolder = now.strftime("%Y_%m_%d_%H_%M_%S")
-runfolder = f"NAS_Search_XGB_ranking_{args.dataset}/surrogate_search/{args.search_data}/reduce/{runfolder}_reduce_{args.name}_{args.dataset}_{args.seed}"
+runfolder = f"NAS_Search_{args.dataset}/surrogate_search/{args.search_data}/reduce/{runfolder}_reduce_{args.name}_{args.dataset}_{args.seed}"
 runfolder = os.path.join(Settings.FOLDER_EXPERIMENTS, runfolder)
 if not os.path.exists(runfolder):
     os.makedirs(runfolder)
@@ -243,36 +241,6 @@ def w_dataloader(train_data, weight_factor, batch_size, weighted_retraining=True
 #                              Training Loop
 #
 ##############################################################################
-# https://github.com/martius-lab/blackbox-backprop
-class Ranker(torch.autograd.Function):
-    """Black-box differentiable rank calculator."""
-
-    _lambda = Variable(torch.tensor(2.0)) #treat as hyperparm
-    @staticmethod
-    def forward(ctx, scores):
-        """
-        scores:  batch_size x num_elements tensor of real valued scores
-        """
-        arg_ranks = torch.argsort(
-            torch.argsort(scores, dim=1, descending=True)
-        ).float() + 1 
-        arg_ranks.requires_grad = True
-        ctx.save_for_backward(scores, arg_ranks, Ranker._lambda)
-        return arg_ranks
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """
-        grad_outputs: upstream gradient batch_size x num_elements
-        """
-        scores, arg_ranks, _lambda = ctx.saved_tensors
-        perturbed_scores = scores + _lambda * grad_output
-        perturbed_arg_ranks = torch.argsort(
-            torch.argsort(perturbed_scores, dim=1, descending=True)
-        ) + 1
-        return - 1/_lambda * (arg_ranks - perturbed_arg_ranks), None 
-
-
 
 
 ##############################################################################
@@ -280,15 +248,11 @@ def train(
     real,
     b_size,
     G,
-    ranking_function, 
     weights,
     optimizer,
     alpha,
-    xgb_model,
     normal_cell,
 ):
-    optimizer.zero_grad()
-
 
     noise = torch.randn(
         b_size, 32,
@@ -299,47 +263,25 @@ def train(
     if normal_cell:
         ln = G.node_criterion(nodes.view(-1,G.num_node_atts),  torch.argmax(real.x_binary_normal, dim=1).view(b_size,-1).flatten())
         le = G.edge_criterion(edges, real.scores_normal.view(b_size, -1))
-        encodings = real.y_normal.reshape(b_size,-1).numpy()
 
     else:
         ln = G.node_criterion(nodes.view(-1,G.num_node_atts),  torch.argmax(real.x_binary_reduce, dim=1).view(b_size,-1).flatten())
         le = G.edge_criterion(edges, real.scores_reduce.view(b_size, -1))
-        encodings = real.y_reduce.reshape(b_size,-1).numpy()
 
 
     ln = torch.mean(ln.view(b_size, -1),1)
     le = torch.mean(le,1)
     recon_loss= 2*(ln+ 0.5*le)
-    
-    ytrain = real.acc.numpy()
-    mean = np.mean(ytrain)
-    std = np.std(ytrain)
-    train_data = xgb.DMatrix(encodings, label=((ytrain - mean) / std))
-    xgb_model = xgb.train(xgb_params, train_data, xgb_model=xgb_model, num_boost_round=500)    
-    # predict
-    train_pred = np.squeeze(xgb_model.predict(train_data))
 
-    scores = torch.tensor([train_pred], dtype=torch.float64, requires_grad=True)
-    true_ranking = torch.argsort( torch.argsort(real.acc, dim=0,  descending=True) ).float() + 1
 
-    ##  Update scores for 20 epochs:
-    for epoch in range(args.epochs):
-        # let your pytorch model calculate some scores
-        # here we simply treat the scores as the parameters
-        
-        # calculate the ranking 
-        pred_ranks = ranking_function(scores)
-        mse = torch.sum((pred_ranks-true_ranking)**2)
-        mse.backward()
+    generated = torch.cat((nodes, edges),1)
 
-        scores.data = scores.data - args.lr * scores.grad #vanilla gradient descent update
-        scores.grad.data.zero_()
-    
-    pred_ranks = ranking_function(scores)
-    mse = torch.sum((pred_ranks-true_ranking)**2)
+    acc = G.Predictor(generated)
+    mse = G.acc_criterion(acc.view(-1), real.acc)
 
     err = (1-alpha)*recon_loss + alpha*mse
-    err = torch.mean(err*weights.to(recon_loss.device))
+    err = torch.mean(err*weights.to(generated.device))
+    optimizer.zero_grad()
 
     err.backward()
     # optimize
@@ -348,24 +290,8 @@ def train(
 
     return (err.item(),
             recon_loss.mean().item(),
-            mse.mean().item(), 
-            xgb_model
+            mse.mean().item()
             )
-
-def eval_tree(xgb_model, test_data, normal_cell):
-
-    if normal_cell:    
-        encodings = np.array([arch.y_normal.numpy() for arch in test_data])
-    else:    
-        encodings = np.array([arch.y_reduce.numpy() for arch in test_data])
-
-    tree_test_data = xgb.DMatrix(encodings)
-    preds = xgb_model.predict(tree_test_data)    
-
-    for i, arch in enumerate(test_data):
-        arch.acc = torch.FloatTensor([preds[i]])
-
-    return test_data
 
 def save_data(Dataset, train_data, path_measures, verbose=False):
     train_data = [Dataset.get_info_generated_graph(d, args.image_data) for d in train_data]
@@ -382,9 +308,6 @@ def save_data(Dataset, train_data, path_measures, verbose=False):
 
 ##############################################################################
 def training_loop():
-
-    ranking_function = Ranker.apply
-
     search_data = args.search_data
     print('Amount of to be searched data: {}'.format(search_data))
 
@@ -404,7 +327,6 @@ def training_loop():
 
     with tqdm.tqdm(total=search_data//2, desc="Instances", unit="") as pbar:
         while True:
-            xgb_model = None
             weighted_dataloader = w_dataloader(conditional_train_data, args.weight_factor, args.batch_size)
             upd = len(conditional_train_data)-pbar.n
             if upd > 0:
@@ -417,33 +339,25 @@ def training_loop():
 
                 b_size = batch.batch.max().item() + 1
 
-                err, recon_loss, pred_loss, xgb_model =  train(
+                err, recon_loss, pred_loss =  train(
                     real = batch,
                     b_size = b_size,
                     G = G,
-                    ranking_function = ranking_function, 
                     weights = w,
                     optimizer = optimizerG,
                     alpha = args.alpha,
-                    xgb_model = xgb_model, 
                     normal_cell = True
 
                 )
                 # measurements for saving
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
-                measurements.add_measure("pred_loss",       pred_loss,      instances)
-
-                checkpoint.save(len(conditional_train_data), only_model=True)
-
+                measurements.add_measure("pred_loss",      pred_loss,      instances)
 
                 instances += b_size
 
 
             if instances >= instances_total:
-                if args.verbose:
-                    pbar.write("Starting Training Tree Method for data size {}...".format(len(conditional_train_data)))
-
                 pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
                 visited = {}
@@ -456,9 +370,6 @@ def training_loop():
                 torch.save(test_data,
                     path_measures_normal.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
-
-                test_data =  eval_tree(xgb_model, test_data, normal_cell=True)
-
 
                 # Sort given the surrogate model
                 sort = sorted(test_data, key=lambda i:i.acc, reverse=True)
@@ -522,7 +433,6 @@ def training_loop():
     instances_total = args.ticks * tick_size
     with tqdm.tqdm(total=search_data, desc="Instances", unit="") as pbar:
         while True:
-            xgb_model = None
             weighted_dataloader = w_dataloader(conditional_train_data, args.weight_factor, args.batch_size)
             upd = len(conditional_train_data)-pbar.n
             if upd > 0:
@@ -535,15 +445,13 @@ def training_loop():
 
                 b_size = batch.batch.max().item() + 1
 
-                err, recon_loss,pred_loss, xgb_model =  train(
+                err, recon_loss, pred_loss =  train(
                     real = batch,
                     b_size = b_size,
                     G = G,
-                    ranking_function = ranking_function,
                     weights = w,
                     optimizer = optimizerG,
                     alpha = args.alpha,
-                    xgb_model = xgb_model,
                     normal_cell = False
 
                 )
@@ -552,15 +460,10 @@ def training_loop():
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
                 measurements.add_measure("pred_loss",      pred_loss,      instances)
 
-                checkpoint.save(len(conditional_train_data), only_model=True)
-
                 instances += b_size
 
 
             if instances >= instances_total:
-                if args.verbose:
-                    pbar.write("Starting Training Tree Method for data size {}...".format(len(conditional_train_data)))
-                
                 pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
                 visited = {}
@@ -573,8 +476,6 @@ def training_loop():
                 torch.save(test_data,
                     path_measures_reduce.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
-
-                test_data =  eval_tree(xgb_model, test_data,normal_cell=False)
 
                 # Sort given the surrogate model
                 sort = sorted(test_data, key=lambda i:i.acc, reverse=True)
@@ -694,23 +595,6 @@ if __name__ == "__main__":
 
         ##############################################################################
         #
-        #                              XGB
-        #
-        ##############################################################################
-
-        xgb_params = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
-            "booster": "gbtree",
-            "max_depth": 6,
-            "min_child_weight": 1,
-            "colsample_bytree": 1,
-            "learning_rate": 0.3,
-            "colsample_bylevel": 1,
-        }
-
-        ##############################################################################
-        #
         #                              Losses
         #
         ##############################################################################
@@ -756,6 +640,8 @@ if __name__ == "__main__":
             optimizers = chkpt_optimizers,
             measurements = measurements
         )
+
+
 
 
         training_loop()

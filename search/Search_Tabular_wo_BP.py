@@ -2,12 +2,12 @@ import torch
 import numpy as np
 import sys, os, random, argparse, pickle, tqdm
 from datetime import datetime
-from sklearn.metrics import mean_squared_error
-import torch.nn.functional as F
+
 
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
 from Measurements import Measurements
 from Optimizer import Optimizer
@@ -33,7 +33,7 @@ parser.add_argument("--device",                 type=str, default="cpu")
 parser.add_argument('--trials',                 type=int, default=1, help='Number of trials')
 parser.add_argument("--dataset",                type=str, default='NB201', help='Choice between NB101 and NB201')
 parser.add_argument('--image_data',             type=str, default='cifar10_valid_converged', help='Only for NB201 relevant, choices between [cifar10_valid_converged, cifar100, ImageNet16-120]')
-parser.add_argument("--name",                   type=str, default="Tabular_Search_wo_LSO")
+parser.add_argument("--name",                   type=str, default="Tabular_Search_wo_bp")
 parser.add_argument("--weight_factor",          type=float, default=10e-3)
 parser.add_argument("--num_init",               type=int, default=16)
 parser.add_argument("--k",                      type=int, default=16)
@@ -57,7 +57,7 @@ args = parser.parse_args()
 ##############################################################################
 now = datetime.now()
 runfolder = now.strftime("%Y_%m_%d_%H_%M_%S")
-runfolder = f"NAS_Search_{args.dataset}/{args.image_data}/{runfolder}_{args.name}_{args.dataset}_{args.seed}"
+runfolder = f"NAS_Search_wo_bp_{args.dataset}/{args.image_data}/{runfolder}_{args.name}_{args.dataset}_{args.seed}"
 runfolder = os.path.join(Settings.FOLDER_EXPERIMENTS, runfolder)
 if not os.path.exists(runfolder):
     os.makedirs(runfolder)
@@ -105,7 +105,6 @@ def sample_data(G,
                 possible_candidates = [possible_candidates[i] for i in random_shuffle[:num]]
                 break
 
-    print('In total generated graphs: {}'.format(i))
     validity = validity/v
     return possible_candidates, visited, validity
 
@@ -114,7 +113,7 @@ def get_rank_weights(outputs, weight_factor):
     ranks = np.argsort(outputs_argsort)
     return 1 / (weight_factor * len(outputs) + ranks)
 
-def w_dataloader(train_data, weight_factor, batch_size, weighted_retraining=False):
+def w_dataloader(train_data, weight_factor, batch_size, weighted_retraining=True):
     b_size = batch_size
     if weighted_retraining:
         weight_factor = weight_factor 
@@ -149,10 +148,24 @@ def train(
 ):  
     optimizer.zero_grad()
 
-    generated, recon_loss, mse = G.loss(real, b_size)
-    err = (1-alpha)*recon_loss + alpha*mse
-    err = torch.mean(err*weights.to(generated.device))
+    noise = torch.randn(
+        b_size, 32,
+        device = real.x.device
+        )
+    nodes, edges = G.Decoder(noise)
+    
+    ln = G.node_criterion(nodes.view(-1,G.num_node_atts),  torch.argmax(real.x_binary, dim=1).view(b_size,-1).flatten())
+    le = G.edge_criterion(edges, real.scores.view(b_size, -1))
 
+    ln = torch.mean(ln.view(b_size, -1),1)
+    le = torch.mean(le,1) 
+    recon_loss = 2*(ln+ 0.5*le)
+
+    acc = G.Predictor(real.y.reshape(b_size,-1))
+    mse = G.acc_criterion(acc.view(-1), real.val_acc)
+
+    err = (1-alpha)*recon_loss + alpha*mse
+    err = torch.mean(err*weights.to(nodes.device))
     err.backward()
     # optimize
     optimizer.step()
@@ -220,7 +233,6 @@ def training_loop():
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
                 measurements.add_measure("pred_loss",      pred_loss,      instances)
-
 
                 instances += b_size
                 
@@ -324,6 +336,7 @@ if __name__ == "__main__":
         elif args.dataset == 'NB201':
             m["nets"]["G"]["pars"]["data_config"]["regression_input"] = 84
         m["nets"]["G"]["pars"]["data_config"]["regression_output"] = 1
+        m["nets"]["G"]["pars"]["data_config"]["regression_hidden"] = m["nets"]["G"]["pars"]["data_config"]["regression_input"]
         m["nets"]["G"]["pars"]["acc_prediction"] = True
         m["nets"]["G"]["pars"]["list_all_lost"] = True
         G = Generator_Decoder(**m["nets"]["G"]["pars"]).to(args.device)
@@ -398,5 +411,7 @@ if __name__ == "__main__":
             measurements = measurements
         )
     
+
+
 
         training_loop()

@@ -7,13 +7,13 @@ import xgboost as xgb
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import DataLoader
 
+sys.path.insert(1, os.path.join(os.getcwd()))
 from Generator import Generator_Decoder
 from Measurements import Measurements
 from Optimizer import Optimizer
 from Checkpoint import Checkpoint
 import Settings
-import datasets.NASBench101 as NASBench101 
-import datasets.NASBench201 as NASBench201
+import datasets.NASBenchNLP as NASBenchNLP
 
 ##############################################################################
 #
@@ -30,7 +30,7 @@ if DEBUGGING:
 parser = argparse.ArgumentParser(description='Args for NAS latent space search experiments')
 parser.add_argument("--device",                 type=str, default="cpu")
 parser.add_argument('--trials',                 type=int, default=1, help='Number of trials')
-parser.add_argument("--dataset",                type=str, default='NB101', help='Choice between NB101 and NB201')
+parser.add_argument("--dataset",                type=str, default='NBNLP', help='Choice between NB101,NB201 and NBNLP')
 parser.add_argument('--image_data',             type=str, default='cifar10_valid_converged', help='Only for NB201 relevant, choices between [cifar10_valid_converged, cifar100, ImageNet16-120]')
 parser.add_argument("--name",                   type=str, default="Tabular_Search_XGB")
 parser.add_argument("--weight_factor",          type=float, default=10e-3)
@@ -41,9 +41,9 @@ parser.add_argument("--ticks",                  type=int, default=1)
 parser.add_argument("--tick_size",              type=int, default=16)  
 parser.add_argument("--batch_size",             type=int, default=16)
 parser.add_argument("--search_data",            type=int, default=310)
-parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBench101")
-parser.add_argument("--saved_iteration",        type=str,  default='best' , help="Which iteration to load of pretrained Generator")
-parser.add_argument("--seed",                   type=int, default=0)
+parser.add_argument("--saved_path",             type=str, help="Load pretrained Generator", default="state_dicts/NASBenchNLP")
+parser.add_argument("--saved_iteration",        type=str, default='best' , help="Which iteration to load of pretrained Generator")
+parser.add_argument("--seed",                   type=int, default=1)
 parser.add_argument("--alpha",                  type=float, default=0.9)
 parser.add_argument("--verbose",                type=str, default=True)
 
@@ -91,21 +91,20 @@ def sample_data(G,
             noise = (-6) * torch.rand(j, latent_dim) + 3
             graphs = G(noise.to(device))
             valid_sampled_data = measurements._compute_validity_score(graphs, search_space,  return_valid_spec=True)
-            if valid_sampled_data == []:
-                continue
-            sampled_y = torch.stack([g.y for g in valid_sampled_data])
-            sampled_hash_idx = dataset.query(sampled_y)  
             validity += len(valid_sampled_data)
-            for i, idx in enumerate(sampled_hash_idx):
-                if idx not in visited:
-                    visited.append(idx)
-                    possible_candidates.append(valid_sampled_data[i])
+            if search_space == 'NBNLP':
+                valid_sampled_data = [arch for arch in valid_sampled_data if len(arch.x) <14]
+            for sampled_data in valid_sampled_data:
+                if str(sampled_data.y.detach().tolist())  not in visited:
+                    possible_candidates.append(sampled_data)
+                    visited[str(sampled_data.y.detach().tolist())] = 1 
             v += j
             if len(possible_candidates) > num:
                 random_shuffle = np.random.permutation(range(len(possible_candidates)))
                 possible_candidates = [possible_candidates[i] for i in random_shuffle[:num]]
                 break
 
+    validity = validity/v
     return possible_candidates, visited, validity
 
 def get_rank_weights(outputs, weight_factor):
@@ -148,7 +147,7 @@ def train(
     optimizer.zero_grad()
 
     generated, recon_loss, mse = G.loss(real, b_size)
-    err = (1-args.alpha)*recon_loss
+    err = (1-args.alpha)*recon_loss 
     err = torch.mean(err*weights.to(recon_loss.device))
 
     err.backward()
@@ -157,7 +156,7 @@ def train(
     # return stats
     
     return (err.item(), 
-            recon_loss.mean().item()
+            recon_loss.mean().item(), 
             )
 
 def save_data(Dataset, train_data, path_measures, verbose=False):
@@ -168,7 +167,10 @@ def save_data(Dataset, train_data, path_measures, verbose=False):
         )
     
     if verbose:
-        top_5_acc = sorted([np.round(d.acc.item(),4) for d in train_data])[-5:]
+        if args.dataset=='NBNLP':
+            top_5_acc = sorted([np.round(d.val_acc.item(),4) for d in train_data])[-5:]
+        else:
+            top_5_acc = sorted([np.round(d.acc.item(),4) for d in train_data])[-5:]
         print('Top 5 acc after gradient method {}'.format(top_5_acc))
 
     return train_data
@@ -185,6 +187,7 @@ def train_tree(train_data):
             "learning_rate": 0.3,
             "colsample_bylevel": 1,
         }
+    # encode train data to adajcency one hot:
     encodings = np.array([arch.y.numpy() for arch in train_data])
 
     ytrain = np.array([arch.val_acc.numpy() for arch in train_data])
@@ -196,10 +199,12 @@ def train_tree(train_data):
     # predict
     train_pred = np.squeeze(bst.predict(train_data))
     train_error = np.mean(abs(train_pred - ytrain))
+    print("RMSE: %f" % (train_error))
     return bst
 
 def eval_tree(bst, test_data):
 
+    # encode test data to adajcency one hot:
     encodings = np.array([arch.y.numpy() for arch in test_data])
 
     tree_test_data = xgb.DMatrix(encodings)
@@ -253,8 +258,9 @@ def training_loop():
                 measurements.add_measure("train_loss",      err,      instances)
                 measurements.add_measure("recon_loss",      recon_loss,      instances)
 
+
                 instances += b_size
-                            
+                
 
             if instances >= instances_total:
                 if args.verbose:
@@ -264,8 +270,10 @@ def training_loop():
                 if args.verbose:
                     pbar.write("Starting evaluation of conditional generator for data size {}...".format(len(conditional_train_data)))
 
-                visited = dataset.query(torch.stack([g.y for g in conditional_train_data]))  
-
+                visited = {}
+                for d in conditional_train_data:
+                    h = str(d.y.detach().tolist()) 
+                    visited[h] = 1
 
                 # Finished Training, now evaluate trained surrogate model for next samples
                 test_data,_,_ = sample_data(G, visited, measurements, args.device, args.dataset, num=args.num_test)
@@ -274,11 +282,10 @@ def training_loop():
                 torch.save(test_data, 
                     path_measures.format("sampled_all_test_"+str(len(conditional_train_data)))
                     )
-                if test_data == []:
-                    search_data = len(conditional_train_data)
-                    continue
+                    
                 # Eval all data and sort by xgb
                 test_data =  eval_tree(bst, test_data)
+                # Sort given the surrogate model
                 sort = sorted(test_data, key=lambda i:i.val_acc)
 
                 for arch in sort[-args.k:]:
@@ -311,9 +318,12 @@ def training_loop():
                 results = []
                 for query in range(args.num_init, len(conditional_train_data), args.k):
                     best_arch = sorted(conditional_train_data[:query], key=lambda i:i.val_acc)[-1]
-                    test_acc = best_arch.acc.item()
                     val_acc = best_arch.val_acc.item()
-                    results.append((query, val_acc, test_acc))
+                    if args.dataset !='NBNLP':
+                        test_acc = best_arch.acc.item()
+                        results.append((query, val_acc, test_acc))
+                    else:
+                        results.append((query, val_acc))
 
                 path = os.path.join(runfolder, '{}_{}.pkl'.format(output_name, trial))
                 print('\n* Trial summary: results')
@@ -328,6 +338,7 @@ def training_loop():
 
 ##############################################################################
 
+# torch.autograd.set_detect_anomaly(True)
 if __name__ == "__main__":
     for i in range(args.trials):
         if args.trials > 1:
@@ -355,8 +366,8 @@ if __name__ == "__main__":
 
         # load Checkpoint for pretrained Generator + MLP Predictor
         m = torch.load(os.path.join(args.saved_path, f"{args.saved_iteration}.model"), map_location=args.device) #pretrained_dict
-        m["nets"]["G"]["pars"]["list_all_lost"] = True
         m["nets"]["G"]["pars"]["acc_prediction"] = False
+        m["nets"]["G"]["pars"]["list_all_lost"] = True
         G = Generator_Decoder(**m["nets"]["G"]["pars"]).to(args.device)
         state_dict = m["nets"]["G"]["state"]
         G_dict = G.state_dict()
@@ -381,19 +392,14 @@ if __name__ == "__main__":
         #
         ##############################################################################
         print("Creating Dataset.")
-        if args.dataset=='NB101':
-            NASBench = NASBench101
-            Dataset = NASBench101.Dataset
-            dataset =  NASBench101.Dataset(batch_size=args.batch_size, sample_size=args.num_init, only_prediction=True)
-        elif args.dataset=='NB201':
-            NASBench = NASBench201
+        if args.dataset=='NBNLP':
+            NASBench = NASBenchNLP
             Dataset = NASBench.Dataset
-            dataset =  NASBench.Dataset(batch_size=args.batch_size, sample_size=args.num_init, only_prediction=True, dataset=args.image_data)
+            dataset =  NASBench.Dataset(batch_size=args.batch_size, sample_size=args.num_init, only_prediction=True, prediction=True)
         else:
             raise TypeError("Unknow Seach Space : {:}".format(args.dataset))
 
         conditional_train_data = dataset.train_data
-        dataset.load_hashes()
 
         ##############################################################################
         #
@@ -429,4 +435,7 @@ if __name__ == "__main__":
             measurements = measurements
         )
     
+
+
+
         training_loop()

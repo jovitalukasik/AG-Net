@@ -2,7 +2,6 @@
 
 Jovita Lukasik, Steffen Jung, Margret Keuper
 
-In ECCV 2022
 
 ## Generative Model using Latent Space Optimization 
 
@@ -37,34 +36,33 @@ Define directory path in Settings.py
 ### Generation 
 
 ```
-**NAS-Bench-101**
-Train_G_NB101.sh
-Train_G_NB201.sh
-Train_G_NBNLP.sh
-Train_G_NB301.sh
+bash scripts/Train_G_NB101.sh
+bash scripts/Train_G_NB201.sh
+bash scripts/Train_G_NBNLP.sh
+bash scripts/Train_G_NB301.sh
 ```
 
 To train the generator model in the NAS-Bench-301 search space first run 'datasets/NASBench301/create_random_data.py' to generate 500 k random data.
 
 ### Search using AG-Net on CIFAR
 ```
-Search_NB101.sh 
-Search_NB201.sh 
-Search_NB301.sh 
-Search_NBNLP.sh 
-Search_HW.sh 
+bash scripts/Search_NB101.sh 
+bash scripts/Search_NB201.sh 
+bash scripts/Search_NB301.sh 
+bash scripts/Search_NBNLP.sh 
+bash scripts/Search_HW.sh 
 ```
 
 
 ### Search on ImageNet
 Follow [TENAS](https://github.com/VITA-Group/TENAS) for initial steps and architecture evaluations 
 ```
-Search_TENAS.sh
+bash scripts/Search_TENAS.sh
 ```
 
 ### Search using XGB
 ```
-Search_NB101_XGB_XGBranking.sh
+bash scripts/Search_NB101_XGB_XGBranking.sh
 ```
 
 ## Citation
