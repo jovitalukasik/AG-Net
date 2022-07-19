@@ -42,7 +42,8 @@ bash scripts/Train_G_NBNLP.sh
 bash scripts/Train_G_NB301.sh
 ```
 
-To train the generator model in the NAS-Bench-301 search space first run 'datasets/NASBench301/create_random_data.py' to generate 500 k random data.
+To train the generator model in the NAS-Bench-301 search space first run ```datasets/NASBench301/create_random_data.py``` to generate 500 k random data.
+The pretrained genation model state dicts are in ```state_dicts\```
 
 ### Search using AG-Net on CIFAR
 ```
