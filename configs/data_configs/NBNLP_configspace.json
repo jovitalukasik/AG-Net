@@ -1,0 +1,6 @@
+{   "num_node_atts": 9,
+    "max_num_nodes":26,
+    "regression_input": 559,
+    "regression_output": 1,
+    "data_name":"NBNLP" 
+    }

@@ -1,0 +1,6 @@
+{   "num_node_atts": 11,
+    "max_num_nodes":11,
+    "regression_input": 176,
+    "regression_output": 1,
+    "data_name":"NB301" 
+    }

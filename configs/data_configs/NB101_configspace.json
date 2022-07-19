@@ -1,0 +1,10 @@
+{
+"num_node_atts": 5,
+"max_num_nodes":7,
+"regression_input": 56,
+"regression_output": 1,
+"paths": 364,
+"paths_cutoff": 40,
+"data_name":"NB101",
+"target":"test_acc"  
+}

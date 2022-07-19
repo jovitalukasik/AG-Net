@@ -1,0 +1,8 @@
+{   "num_node_atts": 7,
+    "max_num_nodes":8,
+    "regression_input": 84,
+    "regression_output": 1,
+    "paths": 155,
+    "paths_cutoff": 30,
+    "data_name":"NB201" 
+    }

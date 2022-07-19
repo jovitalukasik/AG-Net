@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.pylint.d
+.ipynb_checkpoints/
+
+datasets/NASBench101/*
+datasets/NASBench301/cache*
+datasets/NASBench301/normal_cell_topologies.json
+
+datasets/NASBench201/*
+datasets/NASBenchNLP/*
+datasets/nasbenchNLP/*
+
+Experiments/
+notebooks/.ipynb*
+
+.vscode/
+
+
+notebooks/

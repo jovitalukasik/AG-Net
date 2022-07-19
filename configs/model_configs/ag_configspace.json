@@ -1,0 +1,58 @@
+{
+  "hyperparameters": [
+    {
+      "name": "node_embedding_dim",
+      "type": "uniform_int",
+      "log": true,
+      "lower": 16,
+      "upper": 256,
+      "default": 32
+    },
+    {
+      "name": "graph_embedding_dim",
+      "type": "uniform_int",
+      "log": true,
+      "lower": 16,
+      "upper": 256,
+      "default": 32
+    },     
+    {
+      "name": "gnn_iteration_layers",
+      "type": "uniform_int",
+      "log": false,
+      "lower": 2,
+      "upper": 5,
+      "default": 2
+    },      
+    {
+      "name": "batch_size",
+      "type": "uniform_int",
+      "log": true,
+      "lower": 8,
+      "upper": 256,
+      "default": 32
+    },  
+    {
+      "name": "num_regression_layers",
+      "type": "uniform_int",
+      "log": true,
+      "lower": 1,
+      "upper": 10,
+      "default": 4
+    },  
+    {
+      "name": "node_dropout",
+      "type": "constant",
+      "value": 0
+    },
+    {
+      "name": "dropout",
+      "type": "constant",
+      "value": 0
+    }  
+  ],
+  "conditions": [],
+  "forbiddens": [],
+  "python_module_version": "0.4.11",
+  "json_format_version": 0.1
+}
