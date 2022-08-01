@@ -1,3 +1,6 @@
+""" Genotypes in DARTS Search Space
+Based on code from https://github.com/VITA-Group/TENAS"""
+
 from collections import namedtuple
 
 Genotype = namedtuple('Genotype', 'normal normal_concat reduce reduce_concat')
