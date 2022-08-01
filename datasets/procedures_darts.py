@@ -1,3 +1,6 @@
+""" NTK and NLR calculation 
+Based on code from https://github.com/VITA-Group/TENAS """
+
 import torch
 import os.path as osp
 import numpy as np
